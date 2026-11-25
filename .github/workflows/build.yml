@@ -149,6 +149,7 @@ jobs:
           import android.graphics.drawable.Drawable;
           import android.os.SystemClock;
           import android.util.Log;
+          import android.view.MotionEvent;
           import android.view.View;
           import android.view.ViewOutlineProvider;
           import android.view.ViewParent;
@@ -177,6 +178,7 @@ jobs:
                       uniform float refr;
                       uniform float disp;
                       uniform float4 tint;
+                  uniform float sat;
 
                       float sdRR(float2 p, float2 b, float r) {
                           float2 q = abs(p) - b + float2(r);
@@ -205,7 +207,7 @@ jobs:
                           float2 uB = clamp(fc - off * (1.0 + disp), lo, hi);
                           float3 rgb = float3(image.eval(uR).r, image.eval(uG).g, image.eval(uB).b);
                           float l = dot(rgb, float3(0.299, 0.587, 0.114));
-                          rgb = mix(float3(l), rgb, 1.2);
+                          rgb = clamp(mix(float3(l), rgb, sat), 0.0, 1.0);
                           rgb = mix(rgb, tint.rgb, tint.a);
                           return half4(half(rgb.r), half(rgb.g), half(rgb.b), 1.0);
                       }
@@ -268,6 +270,12 @@ jobs:
               public static boolean capturing() { return sCapturing != null; }
               public static boolean isGlass(View v) { return BARS.containsKey(v); }
 
+              public static void onTouch(View v, MotionEvent e) {
+                  if (e == null || BARS.isEmpty()) return;
+                  GlassBar g = BARS.get(v);
+                  if (g != null) g.touch(e);
+              }
+
               public static boolean blocks(View v, Drawable d) {
                   GlassBar g = BARS.get(v);
                   return g != null && g.installed && !g.installing && d != g.glass;
@@ -329,6 +337,61 @@ jobs:
                   this.density = bar.getResources().getDisplayMetrics().density;
               }
 
+              // ---- dokunma sicramasi (yay fizigi) ----
+              static final float STIFF = 420f, ZETA = 0.36f;
+              float sx = 1f, sy = 1f, vx, vy;
+              boolean pressed, springing;
+              long lastT;
+              final Runnable tick = new Runnable() { @Override public void run() { stepSpring(); } };
+
+              public void touch(MotionEvent e) {
+                  if (!installed || cfg.bouncePct <= 0f) return;
+                  int a = e.getActionMasked();
+                  if (a == MotionEvent.ACTION_DOWN) {
+                      if (Math.abs(sx - 1f) < 0.01f && Math.abs(sy - 1f) < 0.01f) {
+                          bar.setPivotX(Math.max(0f, Math.min(bar.getWidth(), e.getX())));
+                          bar.setPivotY(bar.getHeight() / 2f);
+                      }
+                      pressed = true; kick();
+                  } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                      pressed = false; kick();
+                  }
+              }
+
+              private void kick() {
+                  if (springing) return;
+                  springing = true; lastT = SystemClock.uptimeMillis();
+                  bar.postOnAnimation(tick);
+              }
+
+              private void stepSpring() {
+                  if (!bar.isAttachedToWindow()) { resetBounce(); return; }
+                  long now = SystemClock.uptimeMillis();
+                  float dt = Math.min(0.032f, (now - lastT) / 1000f); lastT = now;
+                  float k = cfg.bouncePct / 100f;
+                  float tx = pressed ? 1f + 0.045f * k : 1f;
+                  float ty = pressed ? 1f + 0.12f * k : 1f;
+                  float damp = 2f * ZETA * (float) Math.sqrt(STIFF);
+                  int n = Math.max(1, (int) Math.ceil(dt / 0.004f));
+                  float h = dt / n;
+                  for (int i = 0; i < n; i++) {
+                      vx += (-STIFF * (sx - tx) - damp * vx) * h; sx += vx * h;
+                      vy += (-STIFF * (sy - ty) - damp * vy) * h; sy += vy * h;
+                  }
+                  boolean rest = Math.abs(sx - tx) < 0.0005f && Math.abs(sy - ty) < 0.0005f
+                          && Math.abs(vx) < 0.01f && Math.abs(vy) < 0.01f;
+                  if (rest) { sx = tx; sy = ty; vx = 0f; vy = 0f; springing = false; }
+                  bar.setScaleX(sx); bar.setScaleY(sy);
+                  if (!rest) bar.postOnAnimation(tick);
+              }
+
+              private void resetBounce() {
+                  bar.removeCallbacks(tick);
+                  boolean was = springing || pressed || sx != 1f || sy != 1f;
+                  springing = false; pressed = false; sx = 1f; sy = 1f; vx = 0f; vy = 0f;
+                  if (was) { bar.setScaleX(1f); bar.setScaleY(1f); }
+              }
+
               private void install() {
                   origBg = bar.getBackground();
                   origOutline = bar.getOutlineProvider();
@@ -359,6 +422,7 @@ jobs:
               public void onViewDetachedFromWindow(View v) {
                   if (vto != null && vto.isAlive()) vto.removeOnPreDrawListener(this);
                   vto = null; blurDrawable = null;
+                  resetBounce();
               }
 
               @Override
@@ -410,6 +474,7 @@ jobs:
                       s.setFloatUniform("refr", cfg.refractionDp * density * k);
                       s.setFloatUniform("disp", cfg.dispersionPct / 100f);
                       s.setFloatUniform("tint", t[0], t[1], t[2], tintA);
+                      s.setFloatUniform("sat", cfg.vibrancePct / 100f);
                       RenderEffect e = RenderEffect.createRuntimeShaderEffect(s, "image");
                       float sigma = cfg.blurDp * density * k * 0.5f;
                       if (sigma >= 0.25f)
@@ -514,7 +579,9 @@ jobs:
               public boolean enabled = true, ignoreVersion = false, debug = false;
               public boolean appSystemUi = true, appGallery = true, appPhone = true, appMessages = true, appSettings = true;
               public float blurDp = 16f, refractionDp = 12f, spreadDp = 22f, dispersionPct = 10f, cornerDp = 26f,
-                      rimPct = 70f, glowPct = 80f, depthPct = 60f, tintPct = 16f;
+                      rimPct = 70f, glowPct = 80f, depthPct = 60f, tintPct = 10f,
+                      vibrancePct = 170f, bouncePct = 70f;
+              public boolean autoDetect = true;
               public int tintMode = 0;
               public String custom = "";
               public String[] customTokens = new String[0];
@@ -536,7 +603,10 @@ jobs:
                   rimPct = p.getFloat("rimPct", 70f);
                   glowPct = p.getFloat("glowPct", 80f);
                   depthPct = p.getFloat("depthPct", 60f);
-                  tintPct = p.getFloat("tintPct", 16f);
+                  tintPct = p.getFloat("tintPct", 10f);
+                  vibrancePct = p.getFloat("vibrancePct", 170f);
+                  bouncePct = p.getFloat("bouncePct", 70f);
+                  autoDetect = p.getBoolean("autoDetect", true);
                   tintMode = p.getInt("tintMode", 0);
                   custom = p.getString("custom", "");
                   String c = custom == null ? "" : custom.toLowerCase(Locale.ROOT).trim();
@@ -594,6 +664,7 @@ jobs:
           import android.graphics.drawable.Drawable;
           import android.os.Build;
           import android.os.SystemClock;
+          import android.view.MotionEvent;
           import android.view.View;
           import android.view.ViewGroup;
 
@@ -658,6 +729,11 @@ jobs:
                           if (GlassBar.skip((View) p.args[1])) p.setResult(false);
                       }
                   });
+                  XposedHelpers.findAndHookMethod(ViewGroup.class, "dispatchTouchEvent", MotionEvent.class, new XC_MethodHook() {
+                      @Override protected void beforeHookedMethod(MethodHookParam p) {
+                          try { GlassBar.onTouch((View) p.thisObject, (MotionEvent) p.args[0]); } catch (Throwable ignored) {}
+                      }
+                  });
                   XposedBridge.hookAllMethods(Canvas.class, "drawBitmap", new XC_MethodHook() {
                       @Override protected void beforeHookedMethod(MethodHookParam p) {
                           if (!GlassBar.capturing() || p.args.length == 0 || !(p.args[0] instanceof Bitmap)) return;
@@ -682,9 +758,56 @@ jobs:
                   if (now - lastRefresh > 2000) { lastRefresh = now; refresher.refresh(cfg); }
                   if (!cfg.enabled || !cfg.appEnabled(pkg)) return;
                   if (cacheRev != cfg.rev) { classCache.clear(); idCache.clear(); cacheRev = cfg.rev; }
-                  if (!matches(v) || GlassBar.hasGlassAncestor(v) || !GlassConfig.versionOk(cfg)) return;
+                  if (!GlassConfig.versionOk(cfg)) return;
+                  if (!matches(v)) {
+                      if (cfg.autoDetect && !systemUi) {
+                          final View fv = v;
+                          v.post(() -> { try { autoDetect(fv); } catch (Throwable t) { XposedBridge.log("GlassBar auto: " + t); } });
+                      }
+                      return;
+                  }
+                  if (GlassBar.hasGlassAncestor(v)) return;
                   XposedBridge.log("GlassBar: eslesti " + v.getClass().getName() + " id=" + idName(v));
                   GlassBar.attach(v, cfg, refresher, systemUi);
+              }
+
+              static final String[] BAD = {"recycler","pager","scroll","toolbar","appbar","actionbar",
+                      "statusbar","keyboard","dialog","popup","snackbar","list"};
+
+              static boolean inScroller(View v) {
+                  android.view.ViewParent p = v.getParent();
+                  while (p != null) {
+                      if (p instanceof android.widget.AbsListView || p instanceof android.widget.ScrollView
+                              || p instanceof android.widget.HorizontalScrollView) return true;
+                      String n = p.getClass().getName().toLowerCase(Locale.ROOT);
+                      if (n.contains("recyclerview") || n.contains("scrollview") || n.contains("viewpager")
+                              || n.contains("listview")) return true;
+                      p = p.getParent();
+                  }
+                  return false;
+              }
+
+              // Sinifi taninmayan alttaki yuzen "dock" cubuklarini sekil/konumdan bulur (deneysel)
+              void autoDetect(View v) {
+                  if (!v.isAttachedToWindow() || GlassBar.isGlass(v) || GlassBar.hasGlassAncestor(v)) return;
+                  if (v.getVisibility() != View.VISIBLE || !(v instanceof ViewGroup)) return;
+                  int w = v.getWidth(), h = v.getHeight();
+                  if (w <= 0 || h <= 0 || v.getBackground() == null) return;
+                  android.util.DisplayMetrics dm = v.getResources().getDisplayMetrics();
+                  if (w < dm.widthPixels * 0.5f || w > dm.widthPixels) return;
+                  if (h < 44 * dm.density || h > 110 * dm.density) return;
+                  View root = v.getRootView();
+                  int rh = root.getHeight();
+                  if (rh < dm.heightPixels * 0.8f) return;
+                  int[] loc = new int[2]; v.getLocationInWindow(loc);
+                  if (loc[1] < rh * 0.70f || loc[1] + h < rh * 0.80f) return;
+                  String n = v.getClass().getName().toLowerCase(Locale.ROOT);
+                  if (hasAny(n, BAD) || v instanceof android.widget.AbsListView || v instanceof android.widget.ScrollView
+                          || v instanceof android.widget.HorizontalScrollView) return;
+                  int cc = ((ViewGroup) v).getChildCount();
+                  if (cc < 1 || cc > 8 || inScroller(v)) return;
+                  XposedBridge.log("GlassBar: otomatik bulundu " + v.getClass().getName() + " id=" + idName(v) + " pkg=" + pkg);
+                  GlassBar.attach(v, cfg, refresher, false);
               }
 
               boolean matches(View v) {
@@ -703,7 +826,7 @@ jobs:
                       if (full.startsWith("android.")) break;
                       String s = simple(c);
                       if (hasAny(s, CLS)) return true;
-                      if (systemUi && s.equals("navigationbarview")) return true;
+                      // sistem gezinme cubugu (navigationbarview) bilerek eslestirilmiyor: her uygulamada gorunuyordu
                       for (String t : cfg.customTokens) if (full.contains(t)) return true;
                   }
                   return false;
@@ -809,12 +932,14 @@ jobs:
                   sw("enabled","Cam efektini etkinlestir",true);
                   sw("ignoreVersion","One UI 8.5 surum kontrolunu atla",false);
                   sw("debug","Hata ayiklama gunlukleri (logcat: GlassBar)",false);
+                  sw("autoDetect","Alt bari otomatik algila (deneysel)",true);
                   header("Uygulamalar");
                   sw("appSystemUi","One UI cubugu (SystemUI)",true);
                   sw("appGallery","Galeri",true); sw("appPhone","Telefon",true);
                   sw("appMessages","Mesajlar",true); sw("appSettings","Ayarlar",true);
                   header("Cam");
                   slider("blurDp","Blur (dp)",0,60,16);
+                  slider("vibrancePct","Canlilik / doygunluk (%)",0,300,170);
                   slider("refractionDp","Refraction / kirilma (dp)",0,40,12);
                   slider("spreadDp","Yayilma - kenar genisligi (dp)",4,60,22);
                   slider("dispersionPct","Renk ayrisimi (%)",0,40,10);
@@ -823,7 +948,9 @@ jobs:
                   slider("rimPct","Kenar isigi (%)",0,100,70);
                   slider("glowPct","Kose isigi (%)",0,100,80);
                   slider("depthPct","3D efekt (%)",0,100,60);
-                  slider("tintPct","Renk tonu yogunlugu (%)",0,60,16);
+                  slider("tintPct","Renk tonu yogunlugu (%)",0,60,10);
+                  header("Hareket");
+                  slider("bouncePct","Dokunma sicramasi (%)",0,100,70);
 
                   text("Ton");
                   Spinner tint = new Spinner(this);
@@ -850,7 +977,8 @@ jobs:
                   Button reset = new Button(this); reset.setText("Varsayilanlara don");
                   reset.setOnClickListener(v -> { sp.edit().clear().apply(); recreate(); });
                   col.addView(reset);
-                  GlassBar.attach(bar, cfg, null, false);
+                  final GlassBar gb = GlassBar.attach(bar, cfg, null, false);
+                  bar.setOnTouchListener((vw, ev) -> { gb.touch(ev); return true; });
               }
 
               void changed() { cfg.load(sp); preview.invalidate(); }
