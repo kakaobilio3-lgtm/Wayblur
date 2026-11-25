@@ -1,0 +1,989 @@
+# Glass Bar - One UI 8.5+ refraction cam alt bar (LSPosed modulu)
+name: Build & Release Glass Bar
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release etiketi (orn. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # DÜZELTME: setup-android@v3 yerine manuel SDK kurulumu
+      - name: Android SDK paketlerini kur
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p module
+          cd module
+          mkdir -p app
+          cat > app/build.gradle <<'GLASS_EOF_7731'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'io.github.glassbar'
+              compileSdk 35
+              buildToolsVersion "35.0.0"
+
+              defaultConfig {
+                  applicationId 'io.github.glassbar'
+                  minSdk 33
+                  targetSdk 34
+                  versionCode (project.findProperty('verCode') ?: '1').toInteger()
+                  versionName (project.findProperty('verName') ?: '1.0')
+              }
+
+              signingConfigs {
+                  release {
+                      if (System.getenv('KS_FILE')) {
+                          storeFile file(System.getenv('KS_FILE'))
+                          storePassword System.getenv('KS_PASS')
+                          keyAlias System.getenv('KS_ALIAS')
+                          keyPassword System.getenv('KS_PASS')
+                      }
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
+              }
+          }
+
+          dependencies {
+              compileOnly 'de.robv.android.xposed:api:82'
+          }
+          GLASS_EOF_7731
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'GLASS_EOF_7731'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Glass Bar"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.DayNight">
+
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="One UI 8.5+ alt bar icin refraction cam efekti" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedsharedprefs" android:value="true" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:exported="true"
+                      android:label="Glass Bar">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          GLASS_EOF_7731
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/xposed_init <<'GLASS_EOF_7731'
+          io.github.glassbar.MainHook
+          GLASS_EOF_7731
+          mkdir -p app/src/main/java/io/github/glassbar
+          cat > app/src/main/java/io/github/glassbar/GlassBar.java <<'GLASS_EOF_7731'
+          package io.github.glassbar;
+
+          import android.content.res.Configuration;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.ColorFilter;
+          import android.graphics.Color;
+          import android.graphics.Outline;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.graphics.RectF;
+          import android.graphics.RecordingCanvas;
+          import android.graphics.RenderEffect;
+          import android.graphics.RenderNode;
+          import android.graphics.RuntimeShader;
+          import android.graphics.Shader;
+          import android.graphics.drawable.Drawable;
+          import android.os.SystemClock;
+          import android.util.Log;
+          import android.view.View;
+          import android.view.ViewOutlineProvider;
+          import android.view.ViewParent;
+          import android.view.ViewTreeObserver;
+
+          import java.lang.reflect.Method;
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.Map;
+          import java.util.WeakHashMap;
+
+          public final class GlassBar implements ViewTreeObserver.OnPreDrawListener, View.OnAttachStateChangeListener {
+
+              public interface Refresher {
+                  boolean refresh(GlassConfig cfg);
+              }
+
+              static final String TAG = "GlassBar";
+              static final int DS = 4;
+
+              static final String AGSL_BACKDROP = """
+                      uniform shader image;
+                      uniform float2 size;
+                      uniform float radius;
+                      uniform float spread;
+                      uniform float refr;
+                      uniform float disp;
+                      uniform float4 tint;
+
+                      float sdRR(float2 p, float2 b, float r) {
+                          float2 q = abs(p) - b + float2(r);
+                          return min(max(q.x, q.y), 0.0) + length(max(q, float2(0.0))) - r;
+                      }
+                      float2 nrm(float2 p, float2 b, float r) {
+                          float2 g = float2(
+                              sdRR(p + float2(1.0, 0.0), b, r) - sdRR(p - float2(1.0, 0.0), b, r),
+                              sdRR(p + float2(0.0, 1.0), b, r) - sdRR(p - float2(0.0, 1.0), b, r));
+                          float l = length(g);
+                          if (l < 0.0001) { return float2(0.0, -1.0); }
+                          return g / l;
+                      }
+                      half4 main(float2 fc) {
+                          float2 c = size * 0.5;
+                          float2 p = fc - c;
+                          float d = max(-sdRR(p, c, radius), 0.0);
+                          float t = clamp(d / max(spread, 1.0), 0.0, 1.0);
+                          float prof = 1.0 - sqrt(max(1.0 - (1.0 - t) * (1.0 - t), 0.0));
+                          float2 n = nrm(p, c, radius);
+                          float2 off = n * (refr * prof);
+                          float2 lo = float2(0.5);
+                          float2 hi = size - float2(0.5);
+                          float2 uR = clamp(fc - off * (1.0 - disp), lo, hi);
+                          float2 uG = clamp(fc - off, lo, hi);
+                          float2 uB = clamp(fc - off * (1.0 + disp), lo, hi);
+                          float3 rgb = float3(image.eval(uR).r, image.eval(uG).g, image.eval(uB).b);
+                          float l = dot(rgb, float3(0.299, 0.587, 0.114));
+                          rgb = mix(float3(l), rgb, 1.2);
+                          rgb = mix(rgb, tint.rgb, tint.a);
+                          return half4(half(rgb.r), half(rgb.g), half(rgb.b), 1.0);
+                      }
+                      """;
+
+              static final String AGSL_LIGHT = """
+                      uniform float2 size;
+                      uniform float radius;
+                      uniform float spread;
+                      uniform float rim;
+                      uniform float cglow;
+                      uniform float depth;
+
+                      float sdRR(float2 p, float2 b, float r) {
+                          float2 q = abs(p) - b + float2(r);
+                          return min(max(q.x, q.y), 0.0) + length(max(q, float2(0.0))) - r;
+                      }
+                      float2 nrm(float2 p, float2 b, float r) {
+                          float2 g = float2(
+                              sdRR(p + float2(1.0, 0.0), b, r) - sdRR(p - float2(1.0, 0.0), b, r),
+                              sdRR(p + float2(0.0, 1.0), b, r) - sdRR(p - float2(0.0, 1.0), b, r));
+                          float l = length(g);
+                          if (l < 0.0001) { return float2(0.0, -1.0); }
+                          return g / l;
+                      }
+                      half4 main(float2 fc) {
+                          float2 c = size * 0.5;
+                          float2 p = fc - c;
+                          float d = max(-sdRR(p, c, radius), 0.0);
+                          float2 n = nrm(p, c, radius);
+                          float edge = exp(-d / max(1.5, spread * 0.12));
+                          float wide = exp(-d / max(2.0, spread * 0.6));
+                          float2 L = normalize(float2(-0.55, -0.83));
+                          float l1 = max(dot(n, L), 0.0);
+                          float l2 = max(dot(n, -L), 0.0);
+                          float spec = pow(l1, 2.0) + 0.55 * pow(l2, 2.0);
+                          float2 q = abs(p) - (c - float2(radius));
+                          float cw = smoothstep(-radius * 0.5, radius * 0.35, min(q.x, q.y));
+                          float cornerSpec = cw * (pow(l1, 1.5) + 0.7 * pow(l2, 1.5));
+                          float border = 1.0 - smoothstep(0.0, 1.6, d);
+                          float a1 = rim * (0.50 * edge * spec + cglow * 1.1 * edge * cornerSpec
+                                            + 0.22 * border + 0.10 * wide * l1);
+                          float ty = fc.y / size.y;
+                          float up = clamp(-n.y, 0.0, 1.0);
+                          float dn = clamp(n.y, 0.0, 1.0);
+                          float bev = exp(-d / max(2.0, spread * 0.45));
+                          a1 += depth * (0.10 * (1.0 - ty) + 0.30 * bev * up);
+                          float a2 = depth * (0.22 * smoothstep(0.5, 1.0, ty) + 0.32 * bev * dn);
+                          a1 = clamp(a1, 0.0, 0.95);
+                          a2 = clamp(a2, 0.0, 0.6);
+                          float a = a1 + a2 * (1.0 - a1);
+                          return half4(half(a1), half(a1), half(a1), half(a));
+                      }
+                      """;
+
+              static final Map<View, GlassBar> BARS = Collections.synchronizedMap(new WeakHashMap<View, GlassBar>());
+              static View sCapturing;
+
+              public static boolean skip(View child) { return child != null && child == sCapturing; }
+              public static boolean capturing() { return sCapturing != null; }
+              public static boolean isGlass(View v) { return BARS.containsKey(v); }
+
+              public static boolean blocks(View v, Drawable d) {
+                  GlassBar g = BARS.get(v);
+                  return g != null && g.installed && !g.installing && d != g.glass;
+              }
+
+              public static boolean hasGlassAncestor(View v) {
+                  ViewParent p = v.getParent();
+                  while (p != null) {
+                      if (p instanceof View && BARS.containsKey(p)) return true;
+                      p = p.getParent();
+                  }
+                  return false;
+              }
+
+              public static GlassBar attach(View bar, GlassConfig cfg, Refresher r, boolean windowMode) {
+                  GlassBar g = BARS.get(bar);
+                  if (g != null) return g;
+                  g = new GlassBar(bar, cfg, r, windowMode);
+                  BARS.put(bar, g);
+                  g.install();
+                  return g;
+              }
+
+              final View bar;
+              final GlassConfig cfg;
+              final Refresher refresher;
+              final boolean windowMode;
+              final float density;
+              final RenderNode node = new RenderNode("GlassBackdrop");
+              final Glass glass = new Glass();
+              final Path path = new Path();
+              final RectF rf = new RectF();
+              final Paint tintPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+              final int[] la = new int[2], lb = new int[2];
+
+              Paint lightPaint;
+              Drawable origBg, blurDrawable;
+              ViewOutlineProvider origOutline;
+              boolean origClip;
+              ViewTreeObserver vto;
+              boolean installed, installing, forceRecord = true;
+              int appliedRev = -1, lastW, lastH, lw = 1, lh = 1, hash;
+              long lastRefresh;
+              Bitmap bmp;
+              Canvas bmpCanvas;
+              int[] px;
+
+              final ViewOutlineProvider glassOutline = new ViewOutlineProvider() {
+                  @Override
+                  public void getOutline(View v, Outline o) {
+                      float r = Math.min(cfg.cornerDp * density, Math.min(v.getWidth(), v.getHeight()) / 2f);
+                      o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), r);
+                  }
+              };
+
+              private GlassBar(View bar, GlassConfig cfg, Refresher r, boolean windowMode) {
+                  this.bar = bar; this.cfg = cfg; this.refresher = r;
+                  this.windowMode = windowMode;
+                  this.density = bar.getResources().getDisplayMetrics().density;
+              }
+
+              private void install() {
+                  origBg = bar.getBackground();
+                  origOutline = bar.getOutlineProvider();
+                  origClip = bar.getClipToOutline();
+                  setInstalled(true);
+                  bar.addOnAttachStateChangeListener(this);
+                  if (bar.isAttachedToWindow()) onViewAttachedToWindow(bar);
+              }
+
+              private void setInstalled(boolean on) {
+                  if (on == installed) return;
+                  installed = on; installing = true;
+                  try { bar.setBackground(on ? glass : origBg); } finally { installing = false; }
+                  bar.setOutlineProvider(on ? glassOutline : origOutline);
+                  bar.setClipToOutline(on || origClip);
+              }
+
+              @Override
+              public void onViewAttachedToWindow(View v) {
+                  ViewTreeObserver now = bar.getViewTreeObserver();
+                  if (vto == now && now.isAlive()) return;
+                  vto = now; vto.addOnPreDrawListener(this);
+                  if (windowMode) initWindowBlur();
+                  forceRecord = true; bar.invalidate();
+              }
+
+              @Override
+              public void onViewDetachedFromWindow(View v) {
+                  if (vto != null && vto.isAlive()) vto.removeOnPreDrawListener(this);
+                  vto = null; blurDrawable = null;
+              }
+
+              @Override
+              public boolean onPreDraw() {
+                  try { step(); } catch (Throwable t) { if (cfg.debug) Log.e(TAG, "step", t); }
+                  return true;
+              }
+
+              private void step() {
+                  long now = SystemClock.uptimeMillis();
+                  if (refresher != null && now - lastRefresh > 1500) { lastRefresh = now; refresher.refresh(cfg); }
+                  if (!cfg.enabled) { setInstalled(false); return; }
+                  setInstalled(true);
+                  int w = bar.getWidth(), h = bar.getHeight();
+                  if (w <= 0 || h <= 0 || bar.getVisibility() != View.VISIBLE) return;
+                  if (cfg.rev != appliedRev || w != lastW || h != lastH) rebuild(w, h);
+                  if (!windowMode) capture(w, h);
+              }
+
+              private boolean isDark() {
+                  if (cfg.tintMode == 1) return false;
+                  if (cfg.tintMode == 2) return true;
+                  int m = bar.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+                  return m == Configuration.UI_MODE_NIGHT_YES;
+              }
+
+              private void rebuild(int w, int h) {
+                  appliedRev = cfg.rev; lastW = w; lastH = h;
+                  float corner = Math.min(cfg.cornerDp * density, Math.min(w, h) / 2f);
+                  float spread = Math.max(2f, cfg.spreadDp * density);
+                  float[] t = isDark() ? new float[]{0.06f, 0.06f, 0.08f} : new float[]{1f, 1f, 1f};
+                  float tintA = cfg.tintPct / 100f;
+                  float winA = Math.min(1f, tintA + 0.10f);
+                  tintPaint.setColor(Color.argb(Math.round((windowMode ? winA : tintA) * 255f),
+                          Math.round(t[0] * 255f), Math.round(t[1] * 255f), Math.round(t[2] * 255f)));
+                  if (!windowMode) {
+                      int nlw = Math.max(1, Math.round(w / (float) DS));
+                      int nlh = Math.max(1, Math.round(h / (float) DS));
+                      if (bmp == null || nlw != lw || nlh != lh) {
+                          lw = nlw; lh = nlh;
+                          bmp = Bitmap.createBitmap(lw, lh, Bitmap.Config.ARGB_8888);
+                          bmpCanvas = new Canvas(bmp); px = new int[lw * lh];
+                      }
+                      float k = lw / (float) w;
+                      RuntimeShader s = new RuntimeShader(AGSL_BACKDROP);
+                      s.setFloatUniform("size", (float) lw, (float) lh);
+                      s.setFloatUniform("radius", corner * k);
+                      s.setFloatUniform("spread", spread * k);
+                      s.setFloatUniform("refr", cfg.refractionDp * density * k);
+                      s.setFloatUniform("disp", cfg.dispersionPct / 100f);
+                      s.setFloatUniform("tint", t[0], t[1], t[2], tintA);
+                      RenderEffect e = RenderEffect.createRuntimeShaderEffect(s, "image");
+                      float sigma = cfg.blurDp * density * k * 0.5f;
+                      if (sigma >= 0.25f)
+                          e = RenderEffect.createChainEffect(e,
+                                  RenderEffect.createBlurEffect(sigma, sigma, Shader.TileMode.CLAMP));
+                      node.setPosition(0, 0, lw, lh); node.setRenderEffect(e); forceRecord = true;
+                  }
+                  RuntimeShader ls = new RuntimeShader(AGSL_LIGHT);
+                  ls.setFloatUniform("size", (float) w, (float) h);
+                  ls.setFloatUniform("radius", corner);
+                  ls.setFloatUniform("spread", spread);
+                  ls.setFloatUniform("rim", cfg.rimPct / 100f);
+                  ls.setFloatUniform("cglow", cfg.glowPct / 100f);
+                  ls.setFloatUniform("depth", cfg.depthPct / 100f);
+                  Paint lp = new Paint(Paint.ANTI_ALIAS_FLAG); lp.setShader(ls); lightPaint = lp;
+                  applyBlurParams(corner); bar.invalidateOutline(); bar.invalidate();
+              }
+
+              private void capture(int w, int h) {
+                  View root = bar.getRootView();
+                  if (root == null || root == bar || bmp == null) return;
+                  bar.getLocationInWindow(la); root.getLocationInWindow(lb);
+                  float dx = la[0] - lb[0], dy = la[1] - lb[1];
+                  bmp.eraseColor(0); int sv = bmpCanvas.save(); sCapturing = bar;
+                  try {
+                      bmpCanvas.scale(lw / (float) w, lh / (float) h);
+                      bmpCanvas.translate(-dx, -dy);
+                      bmpCanvas.clipRect(dx, dy, dx + w, dy + h);
+                      root.draw(bmpCanvas);
+                  } catch (Throwable t) {
+                      if (cfg.debug) Log.w(TAG, "capture", t);
+                  } finally { sCapturing = null; bmpCanvas.restoreToCount(sv); }
+                  bmp.getPixels(px, 0, lw, 0, 0, lw, lh);
+                  int hh = Arrays.hashCode(px);
+                  if (hh != hash || forceRecord) {
+                      hash = hh; forceRecord = false;
+                      RecordingCanvas rc = node.beginRecording(lw, lh);
+                      rc.drawBitmap(bmp, 0f, 0f, null); node.endRecording();
+                  }
+              }
+
+              private void initWindowBlur() {
+                  try {
+                      Object vri = View.class.getMethod("getViewRootImpl").invoke(bar);
+                      if (vri == null) return;
+                      Method m = vri.getClass().getMethod("createBackgroundBlurDrawable");
+                      blurDrawable = (Drawable) m.invoke(vri); appliedRev = -1;
+                  } catch (Throwable t) { Log.w(TAG, "window blur yok: " + t); }
+              }
+
+              private void applyBlurParams(float corner) {
+                  if (blurDrawable == null) return;
+                  try {
+                      Class<?> k = blurDrawable.getClass();
+                      k.getMethod("setBlurRadius", int.class).invoke(blurDrawable, Math.round(cfg.blurDp * density));
+                      k.getMethod("setCornerRadius", float.class).invoke(blurDrawable, corner);
+                  } catch (Throwable t) { Log.w(TAG, "blur params: " + t); }
+              }
+
+              private final class Glass extends Drawable {
+                  @Override
+                  public void draw(Canvas c) {
+                      Rect b = getBounds(); int w = b.width(), h = b.height();
+                      if (w <= 0 || h <= 0) return;
+                      float rad = Math.min(cfg.cornerDp * density, Math.min(w, h) / 2f);
+                      rf.set(0, 0, w, h); path.reset();
+                      path.addRoundRect(rf, rad, rad, Path.Direction.CW);
+                      int sv = c.save(); c.translate(b.left, b.top); c.clipPath(path);
+                      boolean hw = c.isHardwareAccelerated() && c instanceof RecordingCanvas;
+                      if (windowMode) {
+                          if (blurDrawable != null) { blurDrawable.setBounds(0, 0, w, h); blurDrawable.draw(c); }
+                          c.drawRect(rf, tintPaint);
+                      } else if (hw && bmp != null) {
+                          int s2 = c.save(); c.scale(w / (float) lw, h / (float) lh);
+                          ((RecordingCanvas) c).drawRenderNode(node); c.restoreToCount(s2);
+                      } else { c.drawRect(rf, tintPaint); }
+                      if (lightPaint != null) c.drawRect(rf, lightPaint);
+                      c.restoreToCount(sv);
+                  }
+                  @Override public void setAlpha(int alpha) {}
+                  @Override public void setColorFilter(ColorFilter cf) {}
+                  @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
+              }
+          }
+          GLASS_EOF_7731
+          mkdir -p app/src/main/java/io/github/glassbar
+          cat > app/src/main/java/io/github/glassbar/GlassConfig.java <<'GLASS_EOF_7731'
+          package io.github.glassbar;
+
+          import android.content.SharedPreferences;
+          import android.os.Build;
+          import java.util.Locale;
+
+          public class GlassConfig {
+              public static final String PREFS = "glass_prefs";
+              public static final String PKG_SYSTEMUI = "com.android.systemui";
+              public static final String[] PKGS = {
+                      "com.android.systemui", "com.sec.android.gallery3d", "com.samsung.android.dialer",
+                      "com.samsung.android.messaging", "com.android.settings"};
+
+              public int rev;
+              public boolean enabled = true, ignoreVersion = false, debug = false;
+              public boolean appSystemUi = true, appGallery = true, appPhone = true, appMessages = true, appSettings = true;
+              public float blurDp = 16f, refractionDp = 12f, spreadDp = 22f, dispersionPct = 10f, cornerDp = 26f,
+                      rimPct = 70f, glowPct = 80f, depthPct = 60f, tintPct = 16f;
+              public int tintMode = 0;
+              public String custom = "";
+              public String[] customTokens = new String[0];
+
+              public synchronized void load(SharedPreferences p) {
+                  enabled = p.getBoolean("enabled", true);
+                  ignoreVersion = p.getBoolean("ignoreVersion", false);
+                  debug = p.getBoolean("debug", false);
+                  appSystemUi = p.getBoolean("appSystemUi", true);
+                  appGallery = p.getBoolean("appGallery", true);
+                  appPhone = p.getBoolean("appPhone", true);
+                  appMessages = p.getBoolean("appMessages", true);
+                  appSettings = p.getBoolean("appSettings", true);
+                  blurDp = p.getFloat("blurDp", 16f);
+                  refractionDp = p.getFloat("refractionDp", 12f);
+                  spreadDp = p.getFloat("spreadDp", 22f);
+                  dispersionPct = p.getFloat("dispersionPct", 10f);
+                  cornerDp = p.getFloat("cornerDp", 26f);
+                  rimPct = p.getFloat("rimPct", 70f);
+                  glowPct = p.getFloat("glowPct", 80f);
+                  depthPct = p.getFloat("depthPct", 60f);
+                  tintPct = p.getFloat("tintPct", 16f);
+                  tintMode = p.getInt("tintMode", 0);
+                  custom = p.getString("custom", "");
+                  String c = custom == null ? "" : custom.toLowerCase(Locale.ROOT).trim();
+                  customTokens = c.isEmpty() ? new String[0] : c.split("[,;\\s]+");
+                  rev++;
+              }
+
+              public boolean appEnabled(String pkg) {
+                  if ("com.android.systemui".equals(pkg)) return appSystemUi;
+                  if ("com.sec.android.gallery3d".equals(pkg)) return appGallery;
+                  if ("com.samsung.android.dialer".equals(pkg)) return appPhone;
+                  if ("com.samsung.android.messaging".equals(pkg)) return appMessages;
+                  if ("com.android.settings".equals(pkg)) return appSettings;
+                  return false;
+              }
+
+              public static boolean isTarget(String pkg) {
+                  for (String s : PKGS) if (s.equals(pkg)) return true;
+                  return false;
+              }
+
+              static int sOneUi = Integer.MIN_VALUE;
+
+              public static synchronized int oneUi() {
+                  if (sOneUi != Integer.MIN_VALUE) return sOneUi;
+                  int r = 0;
+                  try {
+                      Class<?> sp = Class.forName("android.os.SystemProperties");
+                      String s = (String) sp.getMethod("get", String.class, String.class)
+                              .invoke(null, "ro.build.version.oneui", "");
+                      if (s != null && !s.trim().isEmpty()) r = Integer.parseInt(s.trim());
+                  } catch (Throwable ignored) {}
+                  if (r == 0) {
+                      try {
+                          int sem = Build.VERSION.class.getField("SEM_PLATFORM_INT").getInt(null);
+                          if (sem > 0) r = sem - 90000;
+                      } catch (Throwable ignored) {}
+                  }
+                  sOneUi = r; return r;
+              }
+
+              public static boolean versionOk(GlassConfig c) {
+                  if (c.ignoreVersion) return true;
+                  int v = oneUi();
+                  return v <= 0 || v >= 80500;
+              }
+          }
+          GLASS_EOF_7731
+          mkdir -p app/src/main/java/io/github/glassbar
+          cat > app/src/main/java/io/github/glassbar/MainHook.java <<'GLASS_EOF_7731'
+          package io.github.glassbar;
+
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.os.Build;
+          import android.os.SystemClock;
+          import android.view.View;
+          import android.view.ViewGroup;
+
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.WeakHashMap;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XSharedPreferences;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
+
+          public class MainHook implements IXposedHookLoadPackage {
+              static final String MODULE = "io.github.glassbar";
+              static final String[] CLS = {"bottomnavigationview","bottomnavview","bottomnavigationbar",
+                      "bottomnavbar","bottombar","bottomtab","bottomnavigation","bottomnav"};
+              static final String[] IDS = {"bottom_nav","bottom_tab","bottom_bar","bottomnav",
+                      "bottom_navigation","navigation_bottom"};
+              static final String[] EXCL = {"menu","item","indicator","badge","label","icon","text",
+                      "button","divider","shadow","behavior"};
+              static final Map<Bitmap, Bitmap> SW = Collections.synchronizedMap(new WeakHashMap<>());
+
+              final GlassConfig cfg = new GlassConfig();
+              final Map<Class<?>, Boolean> classCache = new HashMap<>();
+              final Map<Integer, Boolean> idCache = new HashMap<>();
+              XSharedPreferences prefs;
+              String pkg; boolean systemUi; int cacheRev = -1; long lastRefresh;
+
+              final GlassBar.Refresher refresher = c -> {
+                  try {
+                      if (prefs != null && prefs.hasFileChanged()) { prefs.reload(); c.load(prefs); return true; }
+                  } catch (Throwable ignored) {}
+                  return false;
+              };
+
+              @Override
+              public void handleLoadPackage(LoadPackageParam lp) {
+                  pkg = lp.packageName;
+                  if (!GlassConfig.isTarget(pkg)) return;
+                  if (Build.VERSION.SDK_INT < 33) return;
+                  systemUi = GlassConfig.PKG_SYSTEMUI.equals(pkg);
+                  prefs = new XSharedPreferences(MODULE, GlassConfig.PREFS);
+                  prefs.makeWorldReadable(); cfg.load(prefs);
+                  XposedBridge.log("GlassBar: " + pkg + " yuklendi, oneui=" + GlassConfig.oneUi() + ", enabled=" + cfg.enabled);
+
+                  XposedHelpers.findAndHookMethod(View.class, "onAttachedToWindow", new XC_MethodHook() {
+                      @Override protected void afterHookedMethod(MethodHookParam p) {
+                          try { onAttach((View) p.thisObject); } catch (Throwable t) { XposedBridge.log("GlassBar onAttach: " + t); }
+                      }
+                  });
+                  XposedHelpers.findAndHookMethod(View.class, "setBackgroundDrawable", Drawable.class, new XC_MethodHook() {
+                      @Override protected void beforeHookedMethod(MethodHookParam p) {
+                          if (GlassBar.blocks((View) p.thisObject, (Drawable) p.args[0])) p.setResult(null);
+                      }
+                  });
+                  XposedHelpers.findAndHookMethod(ViewGroup.class, "drawChild", Canvas.class, View.class, long.class, new XC_MethodHook() {
+                      @Override protected void beforeHookedMethod(MethodHookParam p) {
+                          if (GlassBar.skip((View) p.args[1])) p.setResult(false);
+                      }
+                  });
+                  XposedBridge.hookAllMethods(Canvas.class, "drawBitmap", new XC_MethodHook() {
+                      @Override protected void beforeHookedMethod(MethodHookParam p) {
+                          if (!GlassBar.capturing() || p.args.length == 0 || !(p.args[0] instanceof Bitmap)) return;
+                          Bitmap bm = (Bitmap) p.args[0];
+                          if (bm.getConfig() != Bitmap.Config.HARDWARE) return;
+                          Bitmap sw = swCopy(bm);
+                          if (sw == null) p.setResult(null); else p.args[0] = sw;
+                      }
+                  });
+              }
+
+              static Bitmap swCopy(Bitmap hw) {
+                  Bitmap c = SW.get(hw); if (c != null) return c;
+                  if (hw.getAllocationByteCount() > 4 * 1024 * 1024) return null;
+                  try { c = hw.copy(Bitmap.Config.ARGB_8888, false); } catch (Throwable t) { c = null; }
+                  if (c != null) SW.put(hw, c); return c;
+              }
+
+              void onAttach(View v) {
+                  if (!(v instanceof ViewGroup) || GlassBar.isGlass(v)) return;
+                  long now = SystemClock.uptimeMillis();
+                  if (now - lastRefresh > 2000) { lastRefresh = now; refresher.refresh(cfg); }
+                  if (!cfg.enabled || !cfg.appEnabled(pkg)) return;
+                  if (cacheRev != cfg.rev) { classCache.clear(); idCache.clear(); cacheRev = cfg.rev; }
+                  if (!matches(v) || GlassBar.hasGlassAncestor(v) || !GlassConfig.versionOk(cfg)) return;
+                  XposedBridge.log("GlassBar: eslesti " + v.getClass().getName() + " id=" + idName(v));
+                  GlassBar.attach(v, cfg, refresher, systemUi);
+              }
+
+              boolean matches(View v) {
+                  Class<?> k = v.getClass();
+                  Boolean b = classCache.computeIfAbsent(k, this::classMatches);
+                  if (b) return true;
+                  int id = v.getId();
+                  if (id != View.NO_ID && id > 0) return idCache.computeIfAbsent(id, x -> idMatches(v));
+                  return false;
+              }
+
+              boolean classMatches(Class<?> k) {
+                  if (hasAny(simple(k), EXCL)) return false;
+                  for (Class<?> c = k; c != null && c != ViewGroup.class && c != View.class && c != Object.class; c = c.getSuperclass()) {
+                      String full = c.getName().toLowerCase(Locale.ROOT);
+                      if (full.startsWith("android.")) break;
+                      String s = simple(c);
+                      if (hasAny(s, CLS)) return true;
+                      if (systemUi && s.equals("navigationbarview")) return true;
+                      for (String t : cfg.customTokens) if (full.contains(t)) return true;
+                  }
+                  return false;
+              }
+
+              boolean idMatches(View v) {
+                  String n = idName(v); if (n == null) return false;
+                  n = n.toLowerCase(Locale.ROOT);
+                  if (hasAny(n, EXCL)) return false;
+                  if (hasAny(n, IDS)) return true;
+                  for (String t : cfg.customTokens) if (n.contains(t)) return true;
+                  return false;
+              }
+
+              static String idName(View v) {
+                  try { return v.getResources().getResourceEntryName(v.getId()); } catch (Throwable t) { return null; }
+              }
+              static String simple(Class<?> c) { String n = c.getName(); return n.substring(n.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT); }
+              static boolean hasAny(String s, String[] toks) { for (String t : toks) if (s.contains(t)) return true; return false; }
+          }
+          GLASS_EOF_7731
+          mkdir -p app/src/main/java/io/github/glassbar
+          cat > app/src/main/java/io/github/glassbar/SettingsActivity.java <<'GLASS_EOF_7731'
+          package io.github.glassbar;
+
+          import android.animation.ValueAnimator;
+          import android.app.Activity;
+          import android.content.SharedPreferences;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.LinearGradient;
+          import android.graphics.Paint;
+          import android.graphics.Shader;
+          import android.os.Bundle;
+          import android.text.Editable;
+          import android.text.TextWatcher;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.animation.LinearInterpolator;
+          import android.widget.AdapterView;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.Spinner;
+          import android.widget.Switch;
+          import android.widget.TextView;
+
+          public class SettingsActivity extends Activity {
+              SharedPreferences sp;
+              final GlassConfig cfg = new GlassConfig();
+              FrameLayout preview; LinearLayout col; float dp, phase;
+
+              int px(float v) { return Math.round(v * dp); }
+
+              @SuppressWarnings("deprecation")
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  dp = getResources().getDisplayMetrics().density;
+                  boolean worldOk = true;
+                  try { sp = getSharedPreferences(GlassConfig.PREFS, MODE_WORLD_READABLE); }
+                  catch (SecurityException e) { sp = getSharedPreferences(GlassConfig.PREFS, MODE_PRIVATE); worldOk = false; }
+                  cfg.load(sp);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  preview = new FrameLayout(this) {
+                      @Override protected boolean drawChild(Canvas c, View child, long t) {
+                          if (GlassBar.skip(child)) return false;
+                          return super.drawChild(c, child, t);
+                      }
+                  };
+                  preview.addView(new Backdrop(this), new FrameLayout.LayoutParams(-1, -1));
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL); bar.setGravity(Gravity.CENTER);
+                  for (String s : new String[]{"\u2302","\u25A6","\u2709","\u2699"}) {
+                      TextView tv = new TextView(this); tv.setText(s); tv.setTextSize(24);
+                      tv.setGravity(Gravity.CENTER); tv.setTextColor(Color.WHITE);
+                      tv.setShadowLayer(4f, 0f, 1f, 0x99000000);
+                      bar.addView(tv, new LinearLayout.LayoutParams(0, -1, 1f));
+                  }
+                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-1, px(68), Gravity.BOTTOM);
+                  lp.setMargins(px(16), 0, px(16), px(16));
+                  preview.addView(bar, lp);
+                  root.addView(preview, new LinearLayout.LayoutParams(-1, px(240)));
+                  ScrollView sv = new ScrollView(this);
+                  col = new LinearLayout(this); col.setOrientation(LinearLayout.VERTICAL);
+                  col.setPadding(px(16), px(8), px(16), px(24));
+                  sv.addView(col); root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
+                  setContentView(root);
+
+                  int ov = GlassConfig.oneUi();
+                  String ovs = ov > 0 ? (ov/10000) + "." + ((ov%10000)/100) : "bilinmiyor";
+                  text("LSPosed: " + (worldOk ? "ayar paylasimi tamam" : "modul aktif gorunmuyor")
+                          + "\nOne UI surumu: " + ovs
+                          + "\nDegisiklikten sonra hedef uygulamayi kapatip acin.");
+
+                  header("Genel");
+                  sw("enabled","Cam efektini etkinlestir",true);
+                  sw("ignoreVersion","One UI 8.5 surum kontrolunu atla",false);
+                  sw("debug","Hata ayiklama gunlukleri (logcat: GlassBar)",false);
+                  header("Uygulamalar");
+                  sw("appSystemUi","One UI cubugu (SystemUI)",true);
+                  sw("appGallery","Galeri",true); sw("appPhone","Telefon",true);
+                  sw("appMessages","Mesajlar",true); sw("appSettings","Ayarlar",true);
+                  header("Cam");
+                  slider("blurDp","Blur (dp)",0,60,16);
+                  slider("refractionDp","Refraction / kirilma (dp)",0,40,12);
+                  slider("spreadDp","Yayilma - kenar genisligi (dp)",4,60,22);
+                  slider("dispersionPct","Renk ayrisimi (%)",0,40,10);
+                  slider("cornerDp","Kose yaricapi (dp)",0,40,26);
+                  header("Isik ve 3D");
+                  slider("rimPct","Kenar isigi (%)",0,100,70);
+                  slider("glowPct","Kose isigi (%)",0,100,80);
+                  slider("depthPct","3D efekt (%)",0,100,60);
+                  slider("tintPct","Renk tonu yogunlugu (%)",0,60,16);
+
+                  text("Ton");
+                  Spinner tint = new Spinner(this);
+                  tint.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+                          new String[]{"Otomatik (tema)","Acik cam","Koyu cam"}));
+                  tint.setSelection(sp.getInt("tintMode", 0));
+                  tint.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                      @Override public void onItemSelected(AdapterView<?> a, View v, int pos, long id) {
+                          if (sp.getInt("tintMode",0) != pos) { sp.edit().putInt("tintMode",pos).apply(); changed(); }
+                      }
+                      @Override public void onNothingSelected(AdapterView<?> a) {}
+                  });
+                  col.addView(tint);
+                  header("Ek bar eslesmeleri");
+                  text("Sinif veya id adinda gecen kelimeler (virgulle).");
+                  EditText et = new EditText(this); et.setText(sp.getString("custom",""));
+                  et.setHint("ornek: tabbar, floating_nav");
+                  et.addTextChangedListener(new TextWatcher() {
+                      @Override public void beforeTextChanged(CharSequence s,int a,int b2,int c){}
+                      @Override public void onTextChanged(CharSequence s,int a,int b2,int c){}
+                      @Override public void afterTextChanged(Editable e) { sp.edit().putString("custom",e.toString()).apply(); changed(); }
+                  });
+                  col.addView(et);
+                  Button reset = new Button(this); reset.setText("Varsayilanlara don");
+                  reset.setOnClickListener(v -> { sp.edit().clear().apply(); recreate(); });
+                  col.addView(reset);
+                  GlassBar.attach(bar, cfg, null, false);
+              }
+
+              void changed() { cfg.load(sp); preview.invalidate(); }
+
+              void header(String s) {
+                  TextView t = new TextView(this); t.setText(s); t.setTextSize(16);
+                  t.setTypeface(null,android.graphics.Typeface.BOLD); t.setPadding(0,px(16),0,px(4)); col.addView(t);
+              }
+              void text(String s) {
+                  TextView t = new TextView(this); t.setText(s); t.setTextSize(13); t.setPadding(0,px(4),0,px(4)); col.addView(t);
+              }
+              void sw(String key, String label, boolean def) {
+                  Switch s = new Switch(this); s.setText(label); s.setChecked(sp.getBoolean(key,def)); s.setPadding(0,px(6),0,px(6));
+                  s.setOnCheckedChangeListener((v,on) -> { sp.edit().putBoolean(key,on).apply(); changed(); }); col.addView(s);
+              }
+              void slider(String key, String label, float min, float max, float def) {
+                  TextView t = new TextView(this); SeekBar sb = new SeekBar(this); sb.setMax(1000);
+                  float cur = sp.getFloat(key,def); t.setText(label+": "+Math.round(cur));
+                  sb.setProgress(Math.round((cur-min)/(max-min)*1000f));
+                  sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override public void onProgressChanged(SeekBar s,int pr,boolean user) {
+                          float v = min+(max-min)*pr/1000f; t.setText(label+": "+Math.round(v));
+                          if (user) { sp.edit().putFloat(key,v).apply(); changed(); }
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar s){}
+                      @Override public void onStopTrackingTouch(SeekBar s){}
+                  });
+                  t.setPadding(0,px(8),0,0); col.addView(t); col.addView(sb);
+              }
+
+              class Backdrop extends View {
+                  final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG); ValueAnimator va;
+                  Backdrop(android.content.Context c) { super(c); }
+                  @Override protected void onAttachedToWindow() {
+                      super.onAttachedToWindow();
+                      va = ValueAnimator.ofFloat(0f,1f); va.setDuration(6000);
+                      va.setRepeatCount(ValueAnimator.INFINITE); va.setInterpolator(new LinearInterpolator());
+                      va.addUpdateListener(a -> { phase=(float)a.getAnimatedValue(); invalidate(); }); va.start();
+                  }
+                  @Override protected void onDetachedFromWindow() { if (va!=null) va.cancel(); super.onDetachedFromWindow(); }
+                  @Override protected void onDraw(Canvas c) {
+                      int w=getWidth(), h=getHeight();
+                      p.setShader(new LinearGradient(0,0,w,h,0xFF1E3C72,0xFFE96443,Shader.TileMode.CLAMP));
+                      c.drawRect(0,0,w,h,p); p.setShader(null);
+                      float step=w/5f, period=w+step;
+                      for (int i=-1;i<8;i++) {
+                          float x=(((i*step+phase*step*2f)%period)+period)%period-step*0.5f;
+                          p.setColor(i%2==0?0xCCFFFFFF:0xCC101010);
+                          c.drawRoundRect(x,h*0.50f,x+step*0.55f,h,16f,16f,p);
+                      }
+                      p.setColor(0xFFFFD54F); c.drawCircle(w*(0.2f+0.6f*phase),h*0.35f,h*0.12f,p);
+                      p.setColor(Color.WHITE); p.setTextSize(h*0.22f); c.drawText("GLASS",w*0.06f,h*0.30f,p);
+                  }
+              }
+          }
+          GLASS_EOF_7731
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/arrays.xml <<'GLASS_EOF_7731'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>com.android.systemui</item>
+                  <item>com.sec.android.gallery3d</item>
+                  <item>com.samsung.android.dialer</item>
+                  <item>com.samsung.android.messaging</item>
+                  <item>com.android.settings</item>
+              </string-array>
+          </resources>
+          GLASS_EOF_7731
+          cat > build.gradle <<'GLASS_EOF_7731'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          GLASS_EOF_7731
+          cat > gradle.properties <<'GLASS_EOF_7731'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          GLASS_EOF_7731
+          cat > settings.gradle <<'GLASS_EOF_7731'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories {
+                  google(); mavenCentral()
+                  maven {
+                      url 'https://api.xposed.info/'
+                      content { includeGroup 'de.robv.android.xposed' }
+                  }
+              }
+          }
+          rootProject.name = 'GlassBar'
+          include ':app'
+          GLASS_EOF_7731
+
+      - name: Keystore hazirla
+        working-directory: module
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS_SECRET: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS_SECRET: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > release.jks
+            echo "KS_PASS=$KS_PASS_SECRET" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=$KS_ALIAS_SECRET" >> "$GITHUB_ENV"
+          else
+            echo "::warning::KEYSTORE_BASE64 yok, gecici anahtar uretiliyor"
+            keytool -genkeypair -keystore release.jks -alias glassbar -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass glassbar123 -keypass glassbar123 -dname "CN=GlassBar"
+            echo "KS_PASS=glassbar123" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=glassbar" >> "$GITHUB_ENV"
+          fi
+          echo "KS_FILE=$PWD/release.jks" >> "$GITHUB_ENV"
+
+      - name: Derle
+        working-directory: module
+        run: |
+          VER="${TAG#v}"
+          gradle assembleRelease --no-daemon --stacktrace -PverName="$VER" -PverCode="$GITHUB_RUN_NUMBER"
+          cp app/build/outputs/apk/release/app-release.apk "GlassBar-${TAG}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GlassBar-${{ env.TAG }}
+          path: module/GlassBar-${{ env.TAG }}.apk
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Glass Bar ${{ env.TAG }}
+          files: module/GlassBar-${{ env.TAG }}.apk
+          generate_release_notes: true
