@@ -105,7 +105,7 @@ jobs:
                   android:theme="@android:style/Theme.DeviceDefault.DayNight">
 
                   <meta-data android:name="xposedmodule" android:value="true" />
-                  <meta-data android:name="xposeddescription" android:value="One UI 8.5+ alt bar icin refraction cam efekti" />
+                  <meta-data android:name="xposeddescription" android:value="Refraction glass effect for the One UI 8.5+ bottom bar" />
                   <meta-data android:name="xposedminversion" android:value="93" />
                   <meta-data android:name="xposedsharedprefs" android:value="true" />
                   <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
@@ -1170,44 +1170,44 @@ jobs:
                   setContentView(root);
 
                   int ov = GlassConfig.oneUi();
-                  String ovs = ov > 0 ? (ov/10000) + "." + ((ov%10000)/100) : "bilinmiyor";
-                  text("LSPosed: " + (worldOk ? "ayar paylasimi tamam" : "modul aktif gorunmuyor")
-                          + "\nOne UI surumu: " + ovs
-                          + "\nDegisiklikten sonra hedef uygulamayi kapatip acin.");
+                  String ovs = ov > 0 ? (ov/10000) + "." + ((ov%10000)/100) : "unknown";
+                  text("LSPosed: " + (worldOk ? "settings sharing OK" : "module does not look active")
+                          + "\nOne UI version: " + ovs
+                          + "\nAfter changing settings, force-stop and reopen the target app.");
 
-                  header("Genel");
-                  sw("enabled","Cam efektini etkinlestir",true);
-                  sw("ignoreVersion","One UI 8.5 surum kontrolunu atla",false);
-                  sw("debug","Hata ayiklama gunlukleri (logcat: GlassBar)",false);
-                  header("Uygulamalar");
-                  sw("appSystemUi","One UI cubugu (SystemUI)",true);
-                  sw("appGallery","Galeri",true); sw("appPhone","Telefon",true);
-                  sw("appMessages","Mesajlar",true); sw("appSettings","Ayarlar",true);
-                  sw("appHome","Ana ekran (One UI Home)",true);
-                  header("Oturma (fit)");
-                  text("Mesajlar, Telefon ve Ana ekranda cam, bar iceriginin boyutuna oturur. Hala kayiksa asagidan elle ayarlayin.");
-                  sw("autoFit","Otomatik oturtma (Mesajlar, Telefon, Ana ekran)",true);
-                  slider("fitXDp","Yanlardan ice al (dp)",0,40,0);
-                  slider("fitBottomDp","Alttan yukari al (dp)",0,40,0);
-                  header("Cam");
+                  header("General");
+                  sw("enabled","Enable glass effect",true);
+                  sw("ignoreVersion","Skip One UI 8.5 version check",false);
+                  sw("debug","Debug logs (logcat: GlassBar)",false);
+                  header("Apps");
+                  sw("appSystemUi","One UI bar (SystemUI)",true);
+                  sw("appGallery","Gallery",true); sw("appPhone","Phone",true);
+                  sw("appMessages","Messages",true); sw("appSettings","Settings",true);
+                  sw("appHome","Home screen (One UI Home)",true);
+                  header("Fit");
+                  text("On Messages, Phone and Home screen the glass fits the bar's content. If it is still off, adjust it manually below.");
+                  sw("autoFit","Auto fit (Messages, Phone, Home screen)",true);
+                  slider("fitXDp","Side inset (dp)",0,40,0);
+                  slider("fitBottomDp","Bottom inset (dp)",0,40,0);
+                  header("Glass");
                   slider("blurDp","Blur (dp)",0,60,16);
-                  slider("vibrancePct","Canlilik / doygunluk (%)",0,300,170);
-                  slider("refractionDp","Refraction / kirilma (dp)",0,40,12);
-                  slider("spreadDp","Yayilma - kenar genisligi (dp)",4,60,22);
-                  slider("dispersionPct","Renk ayrisimi (%)",0,40,10);
-                  slider("cornerDp","Kose yaricapi (dp)",0,40,26);
-                  header("Isik ve 3D");
-                  slider("rimPct","Kenar isigi (%)",0,100,70);
-                  slider("glowPct","Kose isigi (%)",0,100,80);
-                  slider("depthPct","3D efekt (%)",0,100,60);
-                  slider("tintPct","Renk tonu yogunlugu (%)",0,60,10);
-                  header("Hareket");
-                  slider("bouncePct","Dokunma sicramasi (%)",0,100,70);
+                  slider("vibrancePct","Vibrancy / saturation (%)",0,300,170);
+                  slider("refractionDp","Refraction (dp)",0,40,12);
+                  slider("spreadDp","Spread - edge width (dp)",4,60,22);
+                  slider("dispersionPct","Color dispersion (%)",0,40,10);
+                  slider("cornerDp","Corner radius (dp)",0,40,26);
+                  header("Light and 3D");
+                  slider("rimPct","Edge light (%)",0,100,70);
+                  slider("glowPct","Corner light (%)",0,100,80);
+                  slider("depthPct","3D effect (%)",0,100,60);
+                  slider("tintPct","Tint strength (%)",0,60,10);
+                  header("Motion");
+                  slider("bouncePct","Touch bounce (%)",0,100,70);
 
-                  text("Ton");
+                  text("Tone");
                   Spinner tint = new Spinner(this);
                   tint.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
-                          new String[]{"Otomatik (tema)","Acik cam","Koyu cam"}));
+                          new String[]{"Auto (theme)","Light glass","Dark glass"}));
                   tint.setSelection(sp.getInt("tintMode", 0));
                   tint.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
                       @Override public void onItemSelected(AdapterView<?> a, View v, int pos, long id) {
@@ -1216,10 +1216,10 @@ jobs:
                       @Override public void onNothingSelected(AdapterView<?> a) {}
                   });
                   col.addView(tint);
-                  header("Ek bar eslesmeleri");
-                  text("Sinif veya id adinda gecen kelimeler (virgulle).");
+                  header("Extra bar matches");
+                  text("Words in the class or id name (comma separated).");
                   EditText et = new EditText(this); et.setText(sp.getString("custom",""));
-                  et.setHint("ornek: tabbar, floating_nav");
+                  et.setHint("e.g. tabbar, floating_nav");
                   et.addTextChangedListener(new TextWatcher() {
                       @Override public void beforeTextChanged(CharSequence s,int a,int b2,int c){}
                       @Override public void onTextChanged(CharSequence s,int a,int b2,int c){}
@@ -1236,13 +1236,13 @@ jobs:
                   });
                   col.addView(expBtn); col.addView(exp);
                   final LinearLayout mainCol = col; col = exp;
-                  text("Deneysel ozellikler. Cam kaydirma varsayilan olarak kapali; eski islevleri bozmaz.");
-                  sw("sliderEnabled","Cam kaydirma lensi (iPhone tarzi)",false);
-                  sw("sliderSwitch","Kaydirarak sekme degistir",true);
-                  slider("sliderPct","Lens belirginligi (%)",20,100,60);
-                  sw("autoDetect","Alt bari otomatik algila",true);
+                  text("Experimental features. Glass slider is off by default and does not break existing behavior.");
+                  sw("sliderEnabled","Glass slider lens (iPhone style)",false);
+                  sw("sliderSwitch","Swipe to switch tabs",true);
+                  slider("sliderPct","Lens strength (%)",20,100,60);
+                  sw("autoDetect","Auto-detect bottom bar",true);
                   col = mainCol;
-                  Button reset = new Button(this); reset.setText("Varsayilanlara don");
+                  Button reset = new Button(this); reset.setText("Reset to defaults");
                   reset.setOnClickListener(v -> { sp.edit().clear().apply(); recreate(); });
                   col.addView(reset);
                   final GlassBar gb = GlassBar.attach(bar, cfg, null, false);
