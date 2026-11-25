@@ -151,6 +151,8 @@ jobs:
           import android.util.Log;
           import android.view.MotionEvent;
           import android.view.View;
+          import android.view.ViewConfiguration;
+          import android.view.ViewGroup;
           import android.view.ViewOutlineProvider;
           import android.view.ViewParent;
           import android.view.ViewTreeObserver;
@@ -291,9 +293,15 @@ jobs:
               }
 
               public static GlassBar attach(View bar, GlassConfig cfg, Refresher r, boolean windowMode) {
+                  return attach(bar, cfg, r, windowMode, false, false);
+              }
+
+              public static GlassBar attach(View bar, GlassConfig cfg, Refresher r, boolean windowMode,
+                                            boolean fitApp, boolean noSlider) {
                   GlassBar g = BARS.get(bar);
                   if (g != null) return g;
                   g = new GlassBar(bar, cfg, r, windowMode);
+                  g.fitApp = fitApp; g.noSlider = noSlider;
                   BARS.put(bar, g);
                   g.install();
                   return g;
@@ -317,6 +325,8 @@ jobs:
               boolean origClip;
               ViewTreeObserver vto;
               boolean installed, installing, forceRecord = true;
+              boolean fitApp, noSlider;
+              int fx, fy, fw, fh;
               int appliedRev = -1, lastW, lastH, lw = 1, lh = 1, hash;
               long lastRefresh;
               Bitmap bmp;
@@ -326,6 +336,10 @@ jobs:
               final ViewOutlineProvider glassOutline = new ViewOutlineProvider() {
                   @Override
                   public void getOutline(View v, Outline o) {
+                      if (fw > 0 && fh > 0) {
+                          o.setRoundRect(fx, fy, fx + fw, fy + fh, Math.min(cfg.cornerDp * density, Math.min(fw, fh) / 2f));
+                          return;
+                      }
                       float r = Math.min(cfg.cornerDp * density, Math.min(v.getWidth(), v.getHeight()) / 2f);
                       o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), r);
                   }
@@ -345,7 +359,9 @@ jobs:
               final Runnable tick = new Runnable() { @Override public void run() { stepSpring(); } };
 
               public void touch(MotionEvent e) {
-                  if (!installed || cfg.bouncePct <= 0f) return;
+                  if (!installed) return;
+                  if (lensOn) { try { lensTouch(e); } catch (Throwable t) { if (cfg.debug) Log.w(TAG, "lens", t); } }
+                  if (cfg.bouncePct <= 0f) return;
                   int a = e.getActionMasked();
                   if (a == MotionEvent.ACTION_DOWN) {
                       if (Math.abs(sx - 1f) < 0.01f && Math.abs(sy - 1f) < 0.01f) {
@@ -392,6 +408,207 @@ jobs:
                   if (was) { bar.setScaleX(1f); bar.setScaleY(1f); }
               }
 
+              // ---- oturma (fit): cam, cubugun gercek icerigine oturur ----
+              private boolean computeFit(int w, int h) {
+                  int x0 = 0, y0 = 0, x1 = w, y1 = h;
+                  if (fitApp && cfg.autoFit && bar instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) bar;
+                      int l = Integer.MAX_VALUE, t = Integer.MAX_VALUE, r = Integer.MIN_VALUE, b = Integer.MIN_VALUE;
+                      for (int i = 0; i < g.getChildCount(); i++) {
+                          View c = g.getChildAt(i);
+                          if (c.getVisibility() != View.VISIBLE || c.getWidth() <= 0 || c.getHeight() <= 0) continue;
+                          l = Math.min(l, c.getLeft()); t = Math.min(t, c.getTop());
+                          r = Math.max(r, c.getRight()); b = Math.max(b, c.getBottom());
+                      }
+                      if (r > l && b > t) {
+                          int padX = Math.round(10f * density), padY = Math.round(6f * density);
+                          int a0 = Math.max(0, l - padX), a1 = Math.min(w, r + padX);
+                          int b0 = Math.max(0, t - padY), b1 = Math.min(h, b + padY);
+                          if (a1 - a0 >= w * 0.5f && b1 - b0 >= 36f * density) { x0 = a0; x1 = a1; y0 = b0; y1 = b1; }
+                      }
+                  }
+                  int mx = Math.round(cfg.fitXDp * density), mb = Math.round(cfg.fitBottomDp * density);
+                  x0 += mx; x1 -= mx; y1 -= mb;
+                  if (x1 - x0 < 8 || y1 - y0 < 8) { x0 = 0; y0 = 0; x1 = w; y1 = h; }
+                  boolean moved = x0 != fx || y0 != fy;
+                  fx = x0; fy = y0; fw = x1 - x0; fh = y1 - y0;
+                  return moved;
+              }
+
+              // ---- deneysel: iPhone tarzi cam kaydirma lensi (varsayilan kapali, dokunmayi tuketmez) ----
+              static final float LX_K = 300f, LS_K = 520f, LP_K = 360f;
+              final float[] ic = new float[8], iw = new float[8];
+              final View[] iv = new View[8];
+              int nIt, sel;
+              float cmin, cmax;
+              Lens lens;
+              boolean lensOn, lensInit, lensAnim, lDrag, lMoved;
+              float lx, lvx, ltx, lsc = 1f, lvs, lpress, lpv, la2, lta, lensW, lensH, lcy, lDownX;
+              View lDownView;
+              long lensT, lHold;
+              final Runnable lensTick = new Runnable() { @Override public void run() { lensStep(); } };
+
+              private void collectItems() {
+                  nIt = 0; sel = -1; cmin = Float.MAX_VALUE; cmax = -Float.MAX_VALUE;
+                  if (!(bar instanceof ViewGroup)) return;
+                  ViewGroup g = (ViewGroup) bar; float ox = 0f;
+                  for (int d = 0; d < 4; d++) {
+                      ViewGroup next = null; int groups = 0;
+                      for (int i = 0; i < g.getChildCount(); i++) {
+                          View c = g.getChildAt(i);
+                          if (c.getVisibility() != View.VISIBLE || c.getWidth() <= 0) continue;
+                          if (c instanceof ViewGroup && ((ViewGroup) c).getChildCount() > 1
+                                  && c.getWidth() >= g.getWidth() * 0.6f) { groups++; next = (ViewGroup) c; }
+                      }
+                      if (groups != 1) break;
+                      ox += next.getLeft(); g = next;
+                  }
+                  for (int i = 0; i < g.getChildCount(); i++) {
+                      View c = g.getChildAt(i);
+                      if (c.getVisibility() != View.VISIBLE || c.getWidth() <= 0) continue;
+                      if (g.getChildCount() > 1 && c.getWidth() >= g.getWidth() * 0.9f) continue;
+                      if (nIt >= 8) { nIt = 0; sel = -1; return; }
+                      float cx = ox + c.getLeft() + c.getTranslationX() + c.getWidth() / 2f;
+                      iv[nIt] = c; ic[nIt] = cx; iw[nIt] = c.getWidth();
+                      cmin = Math.min(cmin, cx); cmax = Math.max(cmax, cx);
+                      if (sel < 0 && (c.isSelected() || c.isActivated())) sel = nIt;
+                      nIt++;
+                  }
+              }
+
+              private int nearest(float x) {
+                  int best = 0; float bd = Float.MAX_VALUE;
+                  for (int i = 0; i < nIt; i++) { float dd = Math.abs(ic[i] - x); if (dd < bd) { bd = dd; best = i; } }
+                  return best;
+              }
+
+              private void syncLens() {
+                  boolean want = cfg.enabled && cfg.sliderEnabled && !noSlider && installed;
+                  if (!want) {
+                      if (lensOn) {
+                          lensOn = false; lDrag = false; lensAnim = false; lensInit = false;
+                          bar.removeCallbacks(lensTick);
+                          try { bar.getOverlay().remove(lens); } catch (Throwable ignored) {}
+                          lens = null;
+                      }
+                      return;
+                  }
+                  if (!lensOn) {
+                      lens = new Lens(); lensOn = true; lensInit = false; la2 = 0f; lta = 0f;
+                      bar.getOverlay().add(lens);
+                  }
+                  int w = bar.getWidth(), h = bar.getHeight();
+                  if (w <= 0 || h <= 0) return;
+                  lens.setBounds(0, 0, w, h);
+                  collectItems();
+                  if (nIt < 2) {
+                      lta = 0f;
+                  } else {
+                      float avg = 0f;
+                      for (int i = 0; i < nIt; i++) avg += iw[i];
+                      avg /= nIt;
+                      lensW = Math.min(fw - 8f * density, Math.max(52f * density, avg - 6f * density));
+                      lensH = Math.min(fh, Math.max(28f * density, fh - 10f * density));
+                      lcy = fy + fh / 2f;
+                      if (!lDrag && SystemClock.uptimeMillis() >= lHold) {
+                          if (sel >= 0) { ltx = ic[sel]; lta = 1f; } else lta = 0f;
+                      }
+                      if (!lensInit && sel >= 0) { lensInit = true; lx = ltx; la2 = lta; lvx = 0f; }
+                  }
+                  if (!lensAnim && (Math.abs(lx - ltx) > 0.3f || Math.abs(la2 - lta) > 0.01f)) kickLens();
+              }
+
+              private void lensTouch(MotionEvent e) {
+                  if (nIt < 2) return;
+                  int a = e.getActionMasked(); float x = e.getX();
+                  if (a == MotionEvent.ACTION_DOWN) {
+                      float y = e.getY();
+                      if (x < fx || x > fx + fw || y < fy || y > fy + fh) return;
+                      int i = nearest(x);
+                      lDrag = true; lMoved = false; lDownX = x; lDownView = iv[i];
+                      ltx = ic[i]; lta = 1f;
+                      if (!lensInit) { lensInit = true; lx = ltx; la2 = 0f; }
+                      kickLens();
+                  } else if (!lDrag) {
+                      return;
+                  } else if (a == MotionEvent.ACTION_MOVE) {
+                      if (!lMoved && Math.abs(x - lDownX) > ViewConfiguration.get(bar.getContext()).getScaledTouchSlop()) lMoved = true;
+                      if (lMoved) ltx = Math.max(cmin, Math.min(cmax, x));
+                      kickLens();
+                  } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                      lDrag = false;
+                      int i = nearest(x);
+                      ltx = ic[i]; lta = 1f; lHold = SystemClock.uptimeMillis() + 450;
+                      if (a == MotionEvent.ACTION_UP && lMoved && cfg.sliderSwitch) {
+                          final View t = iv[i];
+                          if (t != null && t != lDownView) bar.post(new Runnable() { @Override public void run() { t.performClick(); } });
+                      }
+                      kickLens();
+                      bar.postDelayed(new Runnable() { @Override public void run() { bar.invalidate(); } }, 480);
+                  }
+              }
+
+              private void kickLens() {
+                  if (!lensOn || lensAnim) return;
+                  lensAnim = true; lensT = SystemClock.uptimeMillis();
+                  bar.postOnAnimation(lensTick);
+              }
+
+              private void lensStep() {
+                  if (!lensOn || lens == null || !bar.isAttachedToWindow()) { lensAnim = false; return; }
+                  long now = SystemClock.uptimeMillis();
+                  float dt = Math.min(0.032f, (now - lensT) / 1000f); lensT = now;
+                  float tsc = lDrag ? 1.12f : 1f, tpr = lDrag ? 1f : 0f;
+                  float dX = 2f * 0.70f * (float) Math.sqrt(LX_K);
+                  float dS = 2f * 0.50f * (float) Math.sqrt(LS_K);
+                  float dP = 2f * 0.90f * (float) Math.sqrt(LP_K);
+                  int n = Math.max(1, (int) Math.ceil(dt / 0.004f));
+                  float h = dt / n;
+                  for (int i = 0; i < n; i++) {
+                      lvx += (-LX_K * (lx - ltx) - dX * lvx) * h; lx += lvx * h;
+                      lvs += (-LS_K * (lsc - tsc) - dS * lvs) * h; lsc += lvs * h;
+                      lpv += (-LP_K * (lpress - tpr) - dP * lpv) * h; lpress += lpv * h;
+                  }
+                  la2 += (lta - la2) * Math.min(1f, dt * 14f);
+                  boolean rest = Math.abs(lx - ltx) < 0.3f && Math.abs(lvx) < 2f
+                          && Math.abs(lsc - tsc) < 0.002f && Math.abs(lvs) < 0.02f
+                          && Math.abs(lpress - tpr) < 0.005f && Math.abs(lpv) < 0.02f
+                          && Math.abs(la2 - lta) < 0.01f;
+                  if (rest) { lx = ltx; lvx = 0f; lsc = tsc; lvs = 0f; lpress = tpr; lpv = 0f; la2 = lta; lensAnim = false; }
+                  lens.invalidateSelf();
+                  if (!rest) bar.postOnAnimation(lensTick);
+              }
+
+              private final class Lens extends Drawable {
+                  final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), lp = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  final RuntimeShader ls = new RuntimeShader(AGSL_LIGHT);
+
+                  @Override
+                  public void draw(Canvas c) {
+                      if (la2 < 0.02f || lensW <= 0f || lensH <= 0f) return;
+                      float k = Math.max(0.2f, Math.min(1f, cfg.sliderPct / 100f));
+                      float w = lensW * lsc, h = lensH * (1f + (lsc - 1f) * 0.6f);
+                      float r = Math.min(h, w) / 2f;
+                      int sv = c.save(); c.translate(lx - w / 2f, lcy - h / 2f);
+                      float base = isDark() ? 0.16f : 0.34f;
+                      int fa = Math.round(255f * la2 * Math.min(1f, base * k * 1.4f * (1f + 0.8f * lpress)));
+                      fill.setColor(Color.argb(Math.max(0, Math.min(255, fa)), 255, 255, 255));
+                      c.drawRoundRect(0f, 0f, w, h, r, r, fill);
+                      ls.setFloatUniform("size", w, h);
+                      ls.setFloatUniform("radius", r);
+                      ls.setFloatUniform("spread", Math.min(h * 0.5f, 14f * density));
+                      ls.setFloatUniform("rim", 0.4f + 0.6f * k);
+                      ls.setFloatUniform("cglow", 0.8f);
+                      ls.setFloatUniform("depth", 0.30f + 0.20f * lpress);
+                      lp.setShader(ls); lp.setAlpha(Math.round(255f * Math.max(0f, Math.min(1f, la2))));
+                      c.drawRoundRect(0f, 0f, w, h, r, r, lp);
+                      c.restoreToCount(sv);
+                  }
+                  @Override public void setAlpha(int alpha) {}
+                  @Override public void setColorFilter(ColorFilter cf) {}
+                  @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
+              }
+
               private void install() {
                   origBg = bar.getBackground();
                   origOutline = bar.getOutlineProvider();
@@ -422,6 +639,7 @@ jobs:
               public void onViewDetachedFromWindow(View v) {
                   if (vto != null && vto.isAlive()) vto.removeOnPreDrawListener(this);
                   vto = null; blurDrawable = null;
+                  lDrag = false; lensAnim = false; bar.removeCallbacks(lensTick);
                   resetBounce();
               }
 
@@ -434,12 +652,15 @@ jobs:
               private void step() {
                   long now = SystemClock.uptimeMillis();
                   if (refresher != null && now - lastRefresh > 1500) { lastRefresh = now; refresher.refresh(cfg); }
-                  if (!cfg.enabled) { setInstalled(false); return; }
+                  if (!cfg.enabled) { setInstalled(false); syncLens(); return; }
                   setInstalled(true);
                   int w = bar.getWidth(), h = bar.getHeight();
                   if (w <= 0 || h <= 0 || bar.getVisibility() != View.VISIBLE) return;
-                  if (cfg.rev != appliedRev || w != lastW || h != lastH) rebuild(w, h);
-                  if (!windowMode) capture(w, h);
+                  boolean moved = computeFit(w, h);
+                  if (cfg.rev != appliedRev || fw != lastW || fh != lastH) rebuild(fw, fh);
+                  else if (moved) { forceRecord = true; bar.invalidateOutline(); bar.invalidate(); }
+                  if (!windowMode) capture(fw, fh);
+                  syncLens();
               }
 
               private boolean isDark() {
@@ -491,13 +712,14 @@ jobs:
                   ls.setFloatUniform("depth", cfg.depthPct / 100f);
                   Paint lp = new Paint(Paint.ANTI_ALIAS_FLAG); lp.setShader(ls); lightPaint = lp;
                   applyBlurParams(corner); bar.invalidateOutline(); bar.invalidate();
+                  if (lensOn && lens != null) lens.invalidateSelf();
               }
 
               private void capture(int w, int h) {
                   View root = bar.getRootView();
                   if (root == null || root == bar || bmp == null) return;
                   bar.getLocationInWindow(la); root.getLocationInWindow(lb);
-                  float dx = la[0] - lb[0], dy = la[1] - lb[1];
+                  float dx = la[0] - lb[0] + fx, dy = la[1] - lb[1] + fy;
                   bmp.eraseColor(0); int sv = bmpCanvas.save(); sCapturing = bar;
                   try {
                       bmpCanvas.scale(lw / (float) w, lh / (float) h);
@@ -537,12 +759,13 @@ jobs:
               private final class Glass extends Drawable {
                   @Override
                   public void draw(Canvas c) {
-                      Rect b = getBounds(); int w = b.width(), h = b.height();
+                      Rect b = getBounds(); int w = b.width(), h = b.height(); int ox = 0, oy = 0;
+                      if (fw > 0 && fh > 0) { w = fw; h = fh; ox = fx; oy = fy; }
                       if (w <= 0 || h <= 0) return;
                       float rad = Math.min(cfg.cornerDp * density, Math.min(w, h) / 2f);
                       rf.set(0, 0, w, h); path.reset();
                       path.addRoundRect(rf, rad, rad, Path.Direction.CW);
-                      int sv = c.save(); c.translate(b.left, b.top); c.clipPath(path);
+                      int sv = c.save(); c.translate(b.left + ox, b.top + oy); c.clipPath(path);
                       boolean hw = c.isHardwareAccelerated() && c instanceof RecordingCanvas;
                       if (windowMode) {
                           if (blurDrawable != null) { blurDrawable.setBounds(0, 0, w, h); blurDrawable.draw(c); }
@@ -571,13 +794,16 @@ jobs:
           public class GlassConfig {
               public static final String PREFS = "glass_prefs";
               public static final String PKG_SYSTEMUI = "com.android.systemui";
+              public static final String PKG_HOME = "com.sec.android.app.launcher";
               public static final String[] PKGS = {
                       "com.android.systemui", "com.sec.android.gallery3d", "com.samsung.android.dialer",
-                      "com.samsung.android.messaging", "com.android.settings"};
+                      "com.samsung.android.messaging", "com.android.settings", PKG_HOME};
 
               public int rev;
               public boolean enabled = true, ignoreVersion = false, debug = false;
-              public boolean appSystemUi = true, appGallery = true, appPhone = true, appMessages = true, appSettings = true;
+              public boolean appSystemUi = true, appGallery = true, appPhone = true, appMessages = true, appSettings = true, appHome = true;
+              public boolean autoFit = true, sliderEnabled = false, sliderSwitch = true;
+              public float fitXDp = 0f, fitBottomDp = 0f, sliderPct = 60f;
               public float blurDp = 16f, refractionDp = 12f, spreadDp = 22f, dispersionPct = 10f, cornerDp = 26f,
                       rimPct = 70f, glowPct = 80f, depthPct = 60f, tintPct = 10f,
                       vibrancePct = 170f, bouncePct = 70f;
@@ -595,6 +821,13 @@ jobs:
                   appPhone = p.getBoolean("appPhone", true);
                   appMessages = p.getBoolean("appMessages", true);
                   appSettings = p.getBoolean("appSettings", true);
+                  appHome = p.getBoolean("appHome", true);
+                  autoFit = p.getBoolean("autoFit", true);
+                  fitXDp = p.getFloat("fitXDp", 0f);
+                  fitBottomDp = p.getFloat("fitBottomDp", 0f);
+                  sliderEnabled = p.getBoolean("sliderEnabled", false);
+                  sliderSwitch = p.getBoolean("sliderSwitch", true);
+                  sliderPct = p.getFloat("sliderPct", 60f);
                   blurDp = p.getFloat("blurDp", 16f);
                   refractionDp = p.getFloat("refractionDp", 12f);
                   spreadDp = p.getFloat("spreadDp", 22f);
@@ -620,7 +853,15 @@ jobs:
                   if ("com.samsung.android.dialer".equals(pkg)) return appPhone;
                   if ("com.samsung.android.messaging".equals(pkg)) return appMessages;
                   if ("com.android.settings".equals(pkg)) return appSettings;
+                  if (PKG_HOME.equals(pkg)) return appHome;
                   return false;
+              }
+
+              public static boolean isHome(String pkg) { return PKG_HOME.equals(pkg); }
+
+              public static boolean fitPkg(String pkg) {
+                  return PKG_HOME.equals(pkg) || "com.samsung.android.dialer".equals(pkg)
+                          || "com.samsung.android.messaging".equals(pkg);
               }
 
               public static boolean isTarget(String pkg) {
@@ -689,13 +930,14 @@ jobs:
                       "bottom_navigation","navigation_bottom"};
               static final String[] EXCL = {"menu","item","indicator","badge","label","icon","text",
                       "button","divider","shadow","behavior"};
+              static final String[] HOME_TOK = {"hotseat","dock"};
               static final Map<Bitmap, Bitmap> SW = Collections.synchronizedMap(new WeakHashMap<>());
 
               final GlassConfig cfg = new GlassConfig();
               final Map<Class<?>, Boolean> classCache = new HashMap<>();
               final Map<Integer, Boolean> idCache = new HashMap<>();
               XSharedPreferences prefs;
-              String pkg; boolean systemUi; int cacheRev = -1; long lastRefresh;
+              String pkg; boolean systemUi, home, fitApp; int cacheRev = -1; long lastRefresh;
 
               final GlassBar.Refresher refresher = c -> {
                   try {
@@ -710,6 +952,7 @@ jobs:
                   if (!GlassConfig.isTarget(pkg)) return;
                   if (Build.VERSION.SDK_INT < 33) return;
                   systemUi = GlassConfig.PKG_SYSTEMUI.equals(pkg);
+                  home = GlassConfig.isHome(pkg); fitApp = GlassConfig.fitPkg(pkg);
                   prefs = new XSharedPreferences(MODULE, GlassConfig.PREFS);
                   prefs.makeWorldReadable(); cfg.load(prefs);
                   XposedBridge.log("GlassBar: " + pkg + " yuklendi, oneui=" + GlassConfig.oneUi() + ", enabled=" + cfg.enabled);
@@ -768,7 +1011,7 @@ jobs:
                   }
                   if (GlassBar.hasGlassAncestor(v)) return;
                   XposedBridge.log("GlassBar: eslesti " + v.getClass().getName() + " id=" + idName(v));
-                  GlassBar.attach(v, cfg, refresher, systemUi);
+                  GlassBar.attach(v, cfg, refresher, systemUi || home, fitApp, home);
               }
 
               static final String[] BAD = {"recycler","pager","scroll","toolbar","appbar","actionbar",
@@ -792,10 +1035,10 @@ jobs:
                   if (!v.isAttachedToWindow() || GlassBar.isGlass(v) || GlassBar.hasGlassAncestor(v)) return;
                   if (v.getVisibility() != View.VISIBLE || !(v instanceof ViewGroup)) return;
                   int w = v.getWidth(), h = v.getHeight();
-                  if (w <= 0 || h <= 0 || v.getBackground() == null) return;
+                  if (w <= 0 || h <= 0 || (v.getBackground() == null && !home)) return;
                   android.util.DisplayMetrics dm = v.getResources().getDisplayMetrics();
                   if (w < dm.widthPixels * 0.5f || w > dm.widthPixels) return;
-                  if (h < 44 * dm.density || h > 110 * dm.density) return;
+                  if (h < 44 * dm.density || h > (home ? 150f : 110f) * dm.density) return;
                   View root = v.getRootView();
                   int rh = root.getHeight();
                   if (rh < dm.heightPixels * 0.8f) return;
@@ -807,7 +1050,7 @@ jobs:
                   int cc = ((ViewGroup) v).getChildCount();
                   if (cc < 1 || cc > 8 || inScroller(v)) return;
                   XposedBridge.log("GlassBar: otomatik bulundu " + v.getClass().getName() + " id=" + idName(v) + " pkg=" + pkg);
-                  GlassBar.attach(v, cfg, refresher, false);
+                  GlassBar.attach(v, cfg, refresher, home, fitApp, home);
               }
 
               boolean matches(View v) {
@@ -826,6 +1069,7 @@ jobs:
                       if (full.startsWith("android.")) break;
                       String s = simple(c);
                       if (hasAny(s, CLS)) return true;
+                      if (home && hasAny(s, HOME_TOK)) return true;
                       // sistem gezinme cubugu (navigationbarview) bilerek eslestirilmiyor: her uygulamada gorunuyordu
                       for (String t : cfg.customTokens) if (full.contains(t)) return true;
                   }
@@ -837,6 +1081,7 @@ jobs:
                   n = n.toLowerCase(Locale.ROOT);
                   if (hasAny(n, EXCL)) return false;
                   if (hasAny(n, IDS)) return true;
+                  if (home && hasAny(n, HOME_TOK)) return true;
                   for (String t : cfg.customTokens) if (n.contains(t)) return true;
                   return false;
               }
@@ -864,6 +1109,7 @@ jobs:
           import android.text.Editable;
           import android.text.TextWatcher;
           import android.view.Gravity;
+          import android.view.MotionEvent;
           import android.view.View;
           import android.view.animation.LinearInterpolator;
           import android.widget.AdapterView;
@@ -908,6 +1154,7 @@ jobs:
                   bar.setOrientation(LinearLayout.HORIZONTAL); bar.setGravity(Gravity.CENTER);
                   for (String s : new String[]{"\u2302","\u25A6","\u2709","\u2699"}) {
                       TextView tv = new TextView(this); tv.setText(s); tv.setTextSize(24);
+                      tv.setSelected(bar.getChildCount() == 0);
                       tv.setGravity(Gravity.CENTER); tv.setTextColor(Color.WHITE);
                       tv.setShadowLayer(4f, 0f, 1f, 0x99000000);
                       bar.addView(tv, new LinearLayout.LayoutParams(0, -1, 1f));
@@ -932,11 +1179,16 @@ jobs:
                   sw("enabled","Cam efektini etkinlestir",true);
                   sw("ignoreVersion","One UI 8.5 surum kontrolunu atla",false);
                   sw("debug","Hata ayiklama gunlukleri (logcat: GlassBar)",false);
-                  sw("autoDetect","Alt bari otomatik algila (deneysel)",true);
                   header("Uygulamalar");
                   sw("appSystemUi","One UI cubugu (SystemUI)",true);
                   sw("appGallery","Galeri",true); sw("appPhone","Telefon",true);
                   sw("appMessages","Mesajlar",true); sw("appSettings","Ayarlar",true);
+                  sw("appHome","Ana ekran (One UI Home)",true);
+                  header("Oturma (fit)");
+                  text("Mesajlar, Telefon ve Ana ekranda cam, bar iceriginin boyutuna oturur. Hala kayiksa asagidan elle ayarlayin.");
+                  sw("autoFit","Otomatik oturtma (Mesajlar, Telefon, Ana ekran)",true);
+                  slider("fitXDp","Yanlardan ice al (dp)",0,40,0);
+                  slider("fitBottomDp","Alttan yukari al (dp)",0,40,0);
                   header("Cam");
                   slider("blurDp","Blur (dp)",0,60,16);
                   slider("vibrancePct","Canlilik / doygunluk (%)",0,300,170);
@@ -974,11 +1226,40 @@ jobs:
                       @Override public void afterTextChanged(Editable e) { sp.edit().putString("custom",e.toString()).apply(); changed(); }
                   });
                   col.addView(et);
+                  final Button expBtn = new Button(this); expBtn.setText("Experimental  \u25B8");
+                  final LinearLayout exp = new LinearLayout(this); exp.setOrientation(LinearLayout.VERTICAL);
+                  exp.setVisibility(View.GONE);
+                  expBtn.setOnClickListener(v -> {
+                      boolean open = exp.getVisibility() != View.VISIBLE;
+                      exp.setVisibility(open ? View.VISIBLE : View.GONE);
+                      expBtn.setText(open ? "Experimental  \u25BE" : "Experimental  \u25B8");
+                  });
+                  col.addView(expBtn); col.addView(exp);
+                  final LinearLayout mainCol = col; col = exp;
+                  text("Deneysel ozellikler. Cam kaydirma varsayilan olarak kapali; eski islevleri bozmaz.");
+                  sw("sliderEnabled","Cam kaydirma lensi (iPhone tarzi)",false);
+                  sw("sliderSwitch","Kaydirarak sekme degistir",true);
+                  slider("sliderPct","Lens belirginligi (%)",20,100,60);
+                  sw("autoDetect","Alt bari otomatik algila",true);
+                  col = mainCol;
                   Button reset = new Button(this); reset.setText("Varsayilanlara don");
                   reset.setOnClickListener(v -> { sp.edit().clear().apply(); recreate(); });
                   col.addView(reset);
                   final GlassBar gb = GlassBar.attach(bar, cfg, null, false);
-                  bar.setOnTouchListener((vw, ev) -> { gb.touch(ev); return true; });
+                  final LinearLayout fbar = bar;
+                  bar.setOnTouchListener((vw, ev) -> {
+                      gb.touch(ev);
+                      if (ev.getActionMasked() == MotionEvent.ACTION_UP) {
+                          for (int i = 0; i < fbar.getChildCount(); i++) {
+                              View c = fbar.getChildAt(i);
+                              if (ev.getX() >= c.getLeft() && ev.getX() <= c.getRight()) {
+                                  for (int j = 0; j < fbar.getChildCount(); j++) fbar.getChildAt(j).setSelected(j == i);
+                                  break;
+                              }
+                          }
+                      }
+                      return true;
+                  });
               }
 
               void changed() { cfg.load(sp); preview.invalidate(); }
@@ -1045,6 +1326,7 @@ jobs:
                   <item>com.samsung.android.dialer</item>
                   <item>com.samsung.android.messaging</item>
                   <item>com.android.settings</item>
+                  <item>com.sec.android.app.launcher</item>
               </string-array>
           </resources>
           GLASS_EOF_7731
